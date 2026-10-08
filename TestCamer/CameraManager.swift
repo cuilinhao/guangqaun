@@ -594,7 +594,13 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
 
         position = target
         isConfigured = true
-        print("[Camera] configured \(device.localizedName), mode=\(mode), photo=\(photoOutput.maxPhotoDimensions.width)x\(photoOutput.maxPhotoDimensions.height), apertures=\(apertureStops(for: device)), focusTracking=\(supportsFocusTracking(device))")
+        print("[Camera] configured \(device.localizedName), mode=\(mode), photo=\(photoOutput.maxPhotoDimensions.width)x\(photoOutput.maxPhotoDimensions.height), apertures=\(apertureStops(for: device)), apertureRange=\(apertureRangeDescription(for: device)), focusTracking=\(supportsFocusTracking(device))")
+    }
+
+    private func apertureRangeDescription(for device: AVCaptureDevice) -> String {
+        guard #available(iOS 27.0, *) else { return "n/a (iOS < 27), current=ƒ\(device.lensAperture)" }
+        let format = device.activeFormat
+        return "ƒ\(format.minLensAperture)~ƒ\(format.maxLensAperture), current=ƒ\(device.lensAperture)"
     }
 
     private func supportsFocusTracking(_ device: AVCaptureDevice) -> Bool {
