@@ -13,6 +13,7 @@ enum CapturedMedia {
 
     var thumbnail: UIImage? {
         switch self {
+            // 添加实况
         case .photo(_, let image), .livePhoto(_, _, let image):
             return image
         case .video(_, let thumbnail):
