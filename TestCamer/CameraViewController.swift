@@ -789,14 +789,14 @@ private extension CameraViewController {
         apertureIndicator.isHidden = cameraState == nil || displayed <= 0
         apertureIndicator.isUserInteractionEnabled = adjustable
         apertureIndicator.configuration?.attributedTitle = AttributedString(
-            ApertureControlView.format(displayed),
+            ApertureControlView.format(displayed, stops: stops),
             attributes: AttributeContainer([
                 .font: UIFont.monospacedDigitSystemFont(ofSize: 14, weight: .semibold),
                 .foregroundColor: color
             ])
         )
         apertureIndicator.configuration?.baseForegroundColor = color
-        apertureIndicator.accessibilityLabel = "光圈 ƒ\(ApertureControlView.format(displayed))"
+        apertureIndicator.accessibilityLabel = "光圈 ƒ\(ApertureControlView.format(displayed, stops: stops))"
     }
 
     func setAperturePanelShown(_ shown: Bool, animated: Bool = true) {
