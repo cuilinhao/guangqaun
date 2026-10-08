@@ -12,6 +12,7 @@ enum CameraError: LocalizedError, Equatable, Sendable {
     case recordingFailed
     case apertureUnsupported
     case livePhotoUnsupported
+    case focusTrackingUnsupported
 
     var errorDescription: String? {
         switch self {
@@ -37,6 +38,8 @@ enum CameraError: LocalizedError, Equatable, Sendable {
             return "当前镜头或拍摄格式不支持调节光圈。"
         case .livePhotoUnsupported:
             return "当前镜头或模式不支持实况照片。"
+        case .focusTrackingUnsupported:
+            return "当前镜头或拍摄格式不支持追踪对焦。"
         }
     }
 }

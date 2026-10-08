@@ -25,11 +25,15 @@ struct CameraState: Sendable {
     let aperture: ApertureSetting
     let isLivePhotoSupported: Bool
     let isLivePhotoEnabled: Bool
+    let isFocusTrackingSupported: Bool
+    let isFocusTracking: Bool
 }
 
 enum CameraEvent: Sendable {
     case ready(CameraState)
     case lensApertureChanged(Float)
+    /// 被跟踪物体在 metadata output 坐标系中的归一化边框；物体离开画面时为 nil。
+    case focusTrackedObject(CGRect?)
     case interrupted
     case issue(String)
 }
@@ -42,12 +46,14 @@ struct CapturedPhoto: Sendable {
 
 /// 相机会话只在 `sessionQueue` 上改配置；UI 通过不可变快照和事件接收状态。
 final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFileOutputRecordingDelegate,
-    @unchecked Sendable {
+    AVCaptureMetadataOutputObjectsDelegate, @unchecked Sendable {
     let session = AVCaptureSession()
 
     private let sessionQueue = DispatchQueue(label: "com.testcamer.session", qos: .userInitiated)
     private let photoOutput = AVCapturePhotoOutput()
     private let movieOutput = AVCaptureMovieFileOutput()
+    private let metadataOutput = AVCaptureMetadataOutput()
+    private var isFocusTracking = false
     private var deviceInput: AVCaptureDeviceInput?
     private var audioInput: AVCaptureDeviceInput?
     private var mode: CaptureMode = .photo
@@ -293,12 +299,72 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
         }
     }
 
+    /// 锁定 `devicePoint` 处的物体持续对焦；物体移动、离开再回到画面都会继续跟踪。
+    func startFocusTracking(at devicePoint: CGPoint) async throws -> CameraState {
+        try await onSessionQueue { [self] in
+            guard pendingCapture == nil, let device = deviceInput?.device else { throw CameraError.busy }
+            guard #available(iOS 27.0, *), supportsFocusTracking(device),
+                  device.isFocusPointOfInterestSupported else { throw CameraError.focusTrackingUnsupported }
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            // 跟踪期间 focusPointOfInterest 不会更新，主体区域变化时重设对焦会把目标拉回起点。
+            device.isSubjectAreaChangeMonitoringEnabled = false
+            device.isContinuousAutoFocusTrackingEnabled = true
+            device.focusPointOfInterest = devicePoint
+            device.focusMode = .continuousAutoFocus
+            if device.isExposurePointOfInterestSupported {
+                device.exposurePointOfInterest = devicePoint
+                _ = applyExposureMode(to: device)
+            }
+            isFocusTracking = true
+            return makeState()
+        }
+    }
+
+    func stopFocusTracking() async throws -> CameraState {
+        try await onSessionQueue { [self] in
+            if let device = deviceInput?.device {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                disableFocusTracking(on: device)
+                let center = CGPoint(x: 0.5, y: 0.5)
+                if device.isFocusPointOfInterestSupported {
+                    device.focusPointOfInterest = center
+                }
+                if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                }
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = center
+                    _ = applyExposureMode(to: device)
+                }
+            }
+            return makeState()
+        }
+    }
+
+    func metadataOutput(
+        _ output: AVCaptureMetadataOutput,
+        didOutput metadataObjects: [AVMetadataObject],
+        from connection: AVCaptureConnection
+    ) {
+        dispatchPrecondition(condition: .onQueue(sessionQueue))
+        guard #available(iOS 27.0, *), isFocusTracking else { return }
+        let tracked = metadataObjects.first { $0.type == .focusTrackedObject }
+        eventHandler?(.focusTrackedObject(tracked?.bounds))
+    }
+
     func focus(at devicePoint: CGPoint) {
         sessionQueue.async { [self] in
             guard pendingCapture == nil, let device = deviceInput?.device else { return }
             do {
                 try device.lockForConfiguration()
                 defer { device.unlockForConfiguration() }
+                let wasTracking = isFocusTracking
+                disableFocusTracking(on: device)
+                if wasTracking {
+                    eventHandler?(.ready(makeState()))
+                }
                 if device.isFocusPointOfInterestSupported, device.isFocusModeSupported(.autoFocus) {
                     device.focusPointOfInterest = devicePoint
                     device.focusMode = .autoFocus
@@ -500,9 +566,14 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
             try configureMovieRecording()
             updateAudioInput()
             photoOutput.isLivePhotoCaptureEnabled = mode == .photo && photoOutput.isLivePhotoCaptureSupported
+            if !session.outputs.contains(metadataOutput), session.canAddOutput(metadataOutput) {
+                session.addOutput(metadataOutput)
+                metadataOutput.setMetadataObjectsDelegate(self, queue: sessionQueue)
+            }
         }
 
         try selectApertureCapableVideoFormat(for: device)
+        updateMetadataObjectTypes(for: device)
 
         // activeFormat 跟随 sessionPreset 变化，需等提交配置后再选照片尺寸。
         if let preferred = preferredPhotoDimensions(for: device) {
@@ -511,6 +582,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
 
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
+        disableFocusTracking(on: device)
         if device.isFocusModeSupported(.continuousAutoFocus) {
             device.focusMode = .continuousAutoFocus
         }
@@ -522,7 +594,28 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
 
         position = target
         isConfigured = true
-        print("[Camera] configured \(device.localizedName), mode=\(mode), photo=\(photoOutput.maxPhotoDimensions.width)x\(photoOutput.maxPhotoDimensions.height), apertures=\(apertureStops(for: device))")
+        print("[Camera] configured \(device.localizedName), mode=\(mode), photo=\(photoOutput.maxPhotoDimensions.width)x\(photoOutput.maxPhotoDimensions.height), apertures=\(apertureStops(for: device)), focusTracking=\(supportsFocusTracking(device))")
+    }
+
+    private func supportsFocusTracking(_ device: AVCaptureDevice) -> Bool {
+        guard #available(iOS 27.0, *) else { return false }
+        return device.activeFormat.isContinuousAutoFocusTrackingSupported
+            && metadataOutput.metadataObjectTypes.contains(.focusTrackedObject)
+    }
+
+    /// 不订阅 focusTrackedObject 时系统不会启动跟踪；该类型随 activeFormat 出现或消失，须在格式确定后再设置。
+    private func updateMetadataObjectTypes(for device: AVCaptureDevice) {
+        guard #available(iOS 27.0, *), session.outputs.contains(metadataOutput) else { return }
+        let available = device.activeFormat.isContinuousAutoFocusTrackingSupported
+            && metadataOutput.availableMetadataObjectTypes.contains(.focusTrackedObject)
+        metadataOutput.metadataObjectTypes = available ? [.focusTrackedObject] : []
+    }
+
+    /// 调用方需已持有 `lockForConfiguration`。
+    private func disableFocusTracking(on device: AVCaptureDevice) {
+        isFocusTracking = false
+        guard #available(iOS 27.0, *), device.isContinuousAutoFocusTrackingEnabled else { return }
+        device.isContinuousAutoFocusTrackingEnabled = false
     }
 
     /// 视频预设选出的格式不一定带可变光圈；此时换成尺寸最接近、支持光圈且能跑 30fps 的格式。
@@ -541,7 +634,10 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
                 && CMFormatDescriptionGetMediaSubType(format.formatDescription) == subtype
                 && format.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 }
         }
-        guard let best = candidates.min(by: { areaDistance($0) < areaDistance($1) }) else {
+        func rank(_ format: AVCaptureDevice.Format) -> (Int, Int64) {
+            (format.isContinuousAutoFocusTrackingSupported ? 0 : 1, areaDistance(format))
+        }
+        guard let best = candidates.min(by: { rank($0) < rank($1) }) else {
             print("[Camera] no aperture-capable video format on \(device.localizedName)")
             return
         }
@@ -665,7 +761,9 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
             apertureStops: deviceInput.map { apertureStops(for: $0.device) } ?? [],
             aperture: aperture,
             isLivePhotoSupported: mode == .photo && photoOutput.isLivePhotoCaptureSupported,
-            isLivePhotoEnabled: isLivePhotoActive
+            isLivePhotoEnabled: isLivePhotoActive,
+            isFocusTrackingSupported: deviceInput.map { supportsFocusTracking($0.device) } ?? false,
+            isFocusTracking: isFocusTracking
         )
     }
 
@@ -758,7 +856,8 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
         ) { [weak self] _ in
             guard let self else { return }
             self.sessionQueue.async {
-                guard self.pendingCapture == nil, let device = self.deviceInput?.device else { return }
+                guard self.pendingCapture == nil, !self.isFocusTracking,
+                      let device = self.deviceInput?.device else { return }
                 do {
                     try device.lockForConfiguration()
                     defer { device.unlockForConfiguration() }

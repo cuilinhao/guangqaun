@@ -7,7 +7,10 @@ final class CameraViewController: UIViewController {
     private var flashMode: AVCaptureDevice.FlashMode = .off
     private var captureMode: CaptureMode = .photo
     private var cameraState: CameraState? {
-        didSet { syncApertureFromState() }
+        didSet {
+            syncApertureFromState()
+            updateFocusTrackingUI()
+        }
     }
     private var liveAperture: Float = 0
     private var apertureSetting: ApertureSetting = .auto
@@ -46,6 +49,10 @@ final class CameraViewController: UIViewController {
     private let apertureButton = UIButton(type: .system)
     private let apertureIndicator = UIButton(type: .system)
     private let aperturePanel = ApertureControlView()
+    private let trackingBadge = UIButton(type: .system)
+    private let trackingBox = UIView()
+    private let focusHintLabel = PaddedLabel()
+    private var focusHintTask: Task<Void, Never>?
 
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
 
@@ -163,6 +170,9 @@ private extension CameraViewController {
         case .lensApertureChanged(let value):
             liveAperture = value
             updateApertureUI()
+            return
+        case .focusTrackedObject(let rect):
+            updateTrackingBox(metadataRect: rect)
             return
         case .interrupted:
             cameraState = nil
@@ -368,8 +378,44 @@ private extension CameraViewController {
         guard !isCapturing, !isSwitching, !isChangingMode, cameraState?.isRunning == true else { return }
         let location = gesture.location(in: previewView)
         let devicePoint = previewView.previewLayer.captureDevicePointConverted(fromLayerPoint: location)
+        let wasTracking = cameraState?.isFocusTracking == true
         camera.focus(at: devicePoint)
         showFocusIndicator(at: location)
+        if wasTracking {
+            trackingBox.isHidden = true
+        } else if cameraState?.isFocusTrackingSupported == true {
+            showFocusHint("轻点两下以追踪对焦")
+        }
+    }
+
+    @objc func handleDoubleTapToTrack(_ gesture: UITapGestureRecognizer) {
+        guard !isCapturing, !isSwitching, !isChangingMode, cameraState?.isRunning == true else { return }
+        guard cameraState?.isFocusTrackingSupported == true else {
+            handleTapToFocus(gesture)
+            return
+        }
+        let location = gesture.location(in: previewView)
+        let devicePoint = previewView.previewLayer.captureDevicePointConverted(fromLayerPoint: location)
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        hideFocusHint()
+        trackingBox.frame = CGRect(x: location.x - 45, y: location.y - 45, width: 90, height: 90)
+        trackingBox.isHidden = false
+        Task {
+            do {
+                cameraState = try await camera.startFocusTracking(at: devicePoint)
+            } catch {
+                cameraState = try? await camera.currentState()
+                presentError(error)
+            }
+        }
+    }
+
+    @objc func cancelFocusTrackingTapped() {
+        UISelectionFeedbackGenerator().selectionChanged()
+        trackingBox.isHidden = true
+        Task {
+            cameraState = try? await camera.stopFocusTracking()
+        }
     }
 
     @objc func apertureButtonTapped() {
@@ -505,7 +551,13 @@ private extension CameraViewController {
         previewView.addSubview(focusIndicator)
 
         previewView.addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:))))
-        previewView.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(handleTapToFocus(_:))))
+        let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTapToTrack(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        let singleTap = UITapGestureRecognizer(target: self, action: #selector(handleTapToFocus(_:)))
+        singleTap.require(toFail: doubleTap)
+        previewView.addGestureRecognizer(doubleTap)
+        previewView.addGestureRecognizer(singleTap)
+        configureFocusTrackingViews()
 
         NSLayoutConstraint.activate([
             previewView.topAnchor.constraint(equalTo: view.topAnchor),
@@ -610,6 +662,100 @@ private extension CameraViewController {
             self?.setAperturePanelShown(false)
         }
         view.addSubview(aperturePanel)
+    }
+
+    func configureFocusTrackingViews() {
+        trackingBox.layer.borderColor = UIColor.systemYellow.cgColor
+        trackingBox.layer.borderWidth = 1.5
+        trackingBox.layer.cornerRadius = 8
+        trackingBox.layer.cornerCurve = .continuous
+        trackingBox.isUserInteractionEnabled = false
+        trackingBox.isHidden = true
+        previewView.addSubview(trackingBox)
+
+        var badgeConfig = UIButton.Configuration.filled()
+        badgeConfig.attributedTitle = AttributedString(
+            "追踪对焦",
+            attributes: AttributeContainer([.font: UIFont.systemFont(ofSize: 14, weight: .semibold)])
+        )
+        badgeConfig.image = UIImage(systemName: "xmark.circle.fill")
+        badgeConfig.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+        badgeConfig.imagePlacement = .trailing
+        badgeConfig.imagePadding = 6
+        badgeConfig.cornerStyle = .capsule
+        badgeConfig.baseForegroundColor = .black
+        badgeConfig.baseBackgroundColor = .systemYellow
+        badgeConfig.contentInsets = NSDirectionalEdgeInsets(top: 5, leading: 12, bottom: 5, trailing: 8)
+        trackingBadge.configuration = badgeConfig
+        trackingBadge.accessibilityLabel = "取消追踪对焦"
+        trackingBadge.translatesAutoresizingMaskIntoConstraints = false
+        trackingBadge.isHidden = true
+        trackingBadge.addTarget(self, action: #selector(cancelFocusTrackingTapped), for: .touchUpInside)
+        view.addSubview(trackingBadge)
+
+        focusHintLabel.textColor = .white
+        focusHintLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        focusHintLabel.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        focusHintLabel.layer.cornerRadius = 6
+        focusHintLabel.clipsToBounds = true
+        focusHintLabel.alpha = 0
+        focusHintLabel.isUserInteractionEnabled = false
+        focusHintLabel.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(focusHintLabel)
+
+        NSLayoutConstraint.activate([
+            trackingBadge.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            trackingBadge.topAnchor.constraint(equalTo: flashButton.bottomAnchor, constant: 8),
+            focusHintLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            focusHintLabel.centerYAnchor.constraint(equalTo: trackingBadge.centerYAnchor)
+        ])
+    }
+
+    func updateFocusTrackingUI() {
+        let isTracking = cameraState?.isFocusTracking == true
+        trackingBadge.isHidden = !isTracking
+        if !isTracking {
+            trackingBox.isHidden = true
+        }
+    }
+
+    func updateTrackingBox(metadataRect: CGRect?) {
+        guard cameraState?.isFocusTracking == true else { return }
+        guard let metadataRect else {
+            trackingBox.isHidden = true
+            return
+        }
+        let rect = previewView.previewLayer.layerRectConverted(fromMetadataOutputRect: metadataRect)
+        let wasHidden = trackingBox.isHidden
+        trackingBox.isHidden = false
+        if wasHidden {
+            trackingBox.frame = rect
+        } else {
+            UIView.animate(
+                withDuration: 0.1,
+                delay: 0,
+                options: [.beginFromCurrentState, .allowUserInteraction, .curveLinear]
+            ) {
+                self.trackingBox.frame = rect
+            }
+        }
+    }
+
+    func showFocusHint(_ text: String) {
+        focusHintLabel.text = text
+        focusHintTask?.cancel()
+        UIView.animate(withDuration: 0.2) { self.focusHintLabel.alpha = 1 }
+        focusHintTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            self?.hideFocusHint()
+        }
+    }
+
+    func hideFocusHint() {
+        focusHintTask?.cancel()
+        focusHintTask = nil
+        UIView.animate(withDuration: 0.2) { self.focusHintLabel.alpha = 0 }
     }
 
     func syncApertureFromState() {
@@ -989,6 +1135,19 @@ private extension CameraViewController {
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "好", style: .default))
         present(alert, animated: true)
+    }
+}
+
+final class PaddedLabel: UILabel {
+    var insets = UIEdgeInsets(top: 5, left: 10, bottom: 5, right: 10)
+
+    override func drawText(in rect: CGRect) {
+        super.drawText(in: rect.inset(by: insets))
+    }
+
+    override var intrinsicContentSize: CGSize {
+        let size = super.intrinsicContentSize
+        return CGSize(width: size.width + insets.left + insets.right, height: size.height + insets.top + insets.bottom)
     }
 }
 
