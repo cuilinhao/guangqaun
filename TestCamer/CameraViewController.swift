@@ -49,14 +49,13 @@ final class CameraViewController: UIViewController {
     private let apertureButton = UIButton(type: .system)
     private let apertureIndicator = UIButton(type: .system)
     private let aperturePanel = ApertureControlView()
-    /// 只在目标丢失时出现：「目标丢失 ×」。
+    /// 追踪期间显示在顶部：「追踪对焦 ×」，目标丢失时换成「目标丢失 ×」。
     private let trackingBadge = UIButton(type: .system)
     /// 手指拖动时跟手的白框。
     private let selectionBox = UIView()
     private var selectionStart: CGPoint = .zero
-    /// 锁定中是红色整框，追踪中是绿色四角。
+    /// 系统样式的黄色细线框：锁定中半透明，锁定后不透明。
     private let trackingFrame = TrackingFrameView(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
-    private let trackingCloseButton = TrackingCloseButton(frame: CGRect(x: 0, y: 0, width: 24, height: 24))
     private var trackingPhase: TrackingPhase = .idle
     /// 每次框选或取消都会加一，用来丢弃过期的异步结果。
     private var trackingRequestID = 0
@@ -773,7 +772,7 @@ private extension CameraViewController {
     }
 
     func configureFocusTrackingViews() {
-        // 层级：追踪框 < 拖动白框 < ×，换目标时白框画在旧的绿框上面。
+        // 层级：追踪框在拖动白框下面，换目标时白框画在旧框上面。
         trackingFrame.isHidden = true
         previewView.addSubview(trackingFrame)
 
@@ -787,13 +786,9 @@ private extension CameraViewController {
         selectionBox.isHidden = true
         previewView.addSubview(selectionBox)
 
-        trackingCloseButton.isHidden = true
-        trackingCloseButton.addTarget(self, action: #selector(cancelFocusTrackingTapped), for: .touchUpInside)
-        previewView.addSubview(trackingCloseButton)
-
         var badgeConfig = UIButton.Configuration.filled()
         badgeConfig.attributedTitle = AttributedString(
-            "目标丢失",
+            "追踪对焦",
             attributes: AttributeContainer([.font: UIFont.systemFont(ofSize: 14, weight: .semibold)])
         )
         badgeConfig.image = UIImage(systemName: "xmark.circle.fill")
@@ -801,11 +796,11 @@ private extension CameraViewController {
         badgeConfig.imagePlacement = .trailing
         badgeConfig.imagePadding = 6
         badgeConfig.cornerStyle = .capsule
-        badgeConfig.baseForegroundColor = .white
-        badgeConfig.baseBackgroundColor = UIColor.black.withAlphaComponent(0.55)
+        badgeConfig.baseForegroundColor = .black
+        badgeConfig.baseBackgroundColor = .systemYellow
         badgeConfig.contentInsets = NSDirectionalEdgeInsets(top: 5, leading: 12, bottom: 5, trailing: 8)
         trackingBadge.configuration = badgeConfig
-        trackingBadge.accessibilityLabel = "目标丢失，取消追踪对焦"
+        trackingBadge.accessibilityLabel = "取消追踪对焦"
         trackingBadge.translatesAutoresizingMaskIntoConstraints = false
         trackingBadge.isHidden = true
         trackingBadge.addTarget(self, action: #selector(cancelFocusTrackingTapped), for: .touchUpInside)
@@ -859,7 +854,7 @@ private extension CameraViewController {
             print("[Track] locked after \(Int(elapsed * 1000))ms")
             setTrackingPhase(.tracking)
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            // 系统锁得很快时也让红框停留一下，看得出「锁定中 → 已锁定」。
+            // 系统锁得很快时也让半透明框停留一下，看得出「锁定中 → 已锁定」。
             trackingFrame.setStyle(.tracking, animated: true, delay: max(0, TrackingUI.minLockingDisplay - elapsed))
             moveTrackingFrame(to: rect, duration: 0.15)
         case .tracking:
@@ -898,13 +893,26 @@ private extension CameraViewController {
             trackingTimeoutTask = nil
         }
         trackingFrame.isHidden = !showsFrame
-        trackingCloseButton.isHidden = !showsFrame
-        if case .lost = phase {
-            hideFocusHint()
-            trackingBadge.isHidden = false
-        } else {
+        // 顶部胶囊在整个追踪期间都在，目标丢失时换文字。
+        if case .idle = phase {
             trackingBadge.isHidden = true
+        } else {
+            hideFocusHint()
+            if case .lost = phase {
+                updateTrackingBadge(isLost: true)
+            } else {
+                updateTrackingBadge(isLost: false)
+            }
+            trackingBadge.isHidden = false
         }
+    }
+
+    func updateTrackingBadge(isLost: Bool) {
+        trackingBadge.configuration?.attributedTitle = AttributedString(
+            isLost ? "目标丢失" : "追踪对焦",
+            attributes: AttributeContainer([.font: UIFont.systemFont(ofSize: 14, weight: .semibold)])
+        )
+        trackingBadge.accessibilityLabel = isLost ? "目标丢失，取消追踪对焦" : "取消追踪对焦"
     }
 
     /// 收起追踪界面，并让还在路上的锁定请求作废。
@@ -927,11 +935,9 @@ private extension CameraViewController {
     }
 
     func moveTrackingFrame(to rect: CGRect, duration: TimeInterval) {
-        let closeCenter = trackingCloseCenter(for: rect)
         guard duration > 0, !trackingFrame.isHidden else {
             UIView.performWithoutAnimation {
                 trackingFrame.frame = rect
-                trackingCloseButton.center = closeCenter
             }
             return
         }
@@ -941,7 +947,6 @@ private extension CameraViewController {
             options: [.beginFromCurrentState, .allowUserInteraction, .curveLinear]
         ) {
             self.trackingFrame.frame = rect
-            self.trackingCloseButton.center = closeCenter
         }
     }
 
@@ -958,17 +963,6 @@ private extension CameraViewController {
         rect.origin.x = min(max(rect.origin.x, 0), bounds.width - rect.width)
         rect.origin.y = min(max(rect.origin.y, 0), bounds.height - rect.height)
         return rect
-    }
-
-    /// × 默认在框的右上角；贴边或碰到顶部、底部控件时往画面里收。
-    func trackingCloseCenter(for frame: CGRect) -> CGPoint {
-        let inset = trackingCloseButton.bounds.width / 2 + 8
-        let top = flashButton.frame.maxY + inset
-        let bottom = max(top, modeControl.frame.minY - inset)
-        return CGPoint(
-            x: min(max(frame.maxX, inset), previewView.bounds.width - inset),
-            y: min(max(frame.minY, top), bottom)
-        )
     }
 
     func showFocusHint(_ text: String) {
@@ -1408,52 +1402,32 @@ private enum TrackingUI {
     static let minSelectionSide: CGFloat = 40
     /// 超过这个时间还没锁定主体，就退回普通对焦。
     static let lockTimeout: Duration = .seconds(1)
-    /// 红框（锁定中）至少显示这么久再变绿。
+    /// 锁定中的半透明框至少显示这么久，再变成锁定样式。
     static let minLockingDisplay: TimeInterval = 0.2
     /// 主体消失超过这个时间才提示目标丢失。
     static let lostDebounce: Duration = .milliseconds(300)
-    /// 追踪框的最小边长，主体很小时四角不重叠、× 也点得到。
+    /// 追踪框的最小边长，主体很小时框也看得清。
     static let minFrameSide: CGFloat = 44
 }
 
-/// 追踪框：锁定中是红色整框，追踪中是绿色四角。
-/// 子视图都用 autoresizing 跟随外框，外框在动画里改 frame 时四角会一起动。
+/// 追踪框，样式对齐系统相机：黄色 1pt 细线、6pt 圆角。
+/// 锁定中半透明停在用户画的框上；锁定后变成不透明，并像系统对焦框那样轻轻缩一下。
 final class TrackingFrameView: UIView {
     enum Style {
         case locking
         case tracking
     }
 
-    private static let cornerLength: CGFloat = 16
-    private static let cornerLineWidth: CGFloat = 2.5
-    private static let cornerRadius: CGFloat = 6
-
-    private let outline = UIView()
-    private let corners = UIView()
+    private static let lockingAlpha: CGFloat = 0.5
 
     override init(frame: CGRect) {
-        super.init(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        super.init(frame: frame)
         isUserInteractionEnabled = false
-
-        outline.frame = bounds
-        outline.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        outline.layer.borderColor = UIColor.systemRed.cgColor
-        outline.layer.borderWidth = 1.5
-        addSubview(outline)
-
-        corners.frame = bounds
-        corners.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        corners.alpha = 0
-        addSubview(corners)
-        addCorners()
-
-        for shadowed in [outline.layer, corners.layer] {
-            shadowed.shadowColor = UIColor.black.cgColor
-            shadowed.shadowOpacity = 0.35
-            shadowed.shadowRadius = 1.5
-            shadowed.shadowOffset = .zero
-        }
-        self.frame = frame
+        layer.borderColor = UIColor.systemYellow.cgColor
+        layer.borderWidth = 1
+        layer.cornerRadius = 6
+        layer.cornerCurve = .continuous
+        alpha = Self.lockingAlpha
     }
 
     required init?(coder: NSCoder) {
@@ -1461,91 +1435,30 @@ final class TrackingFrameView: UIView {
     }
 
     func setStyle(_ style: Style, animated: Bool, delay: TimeInterval = 0) {
-        // 只清掉透明度动画，不打断外框正在进行的位移动画。
-        outline.layer.removeAnimation(forKey: "opacity")
-        corners.layer.removeAnimation(forKey: "opacity")
-        let changes = {
-            self.outline.alpha = style == .locking ? 1 : 0
-            self.corners.alpha = style == .tracking ? 1 : 0
+        // 只清掉透明度和缩放动画，不打断正在进行的位移动画。
+        layer.removeAnimation(forKey: "opacity")
+        layer.removeAnimation(forKey: "lockPulse")
+        let targetAlpha: CGFloat = style == .locking ? Self.lockingAlpha : 1
+        guard animated else {
+            alpha = targetAlpha
+            return
         }
-        if animated {
-            UIView.animate(
-                withDuration: 0.2,
-                delay: delay,
-                options: [.beginFromCurrentState, .allowUserInteraction],
-                animations: changes
-            )
-        } else {
-            changes()
+        UIView.animate(
+            withDuration: 0.2,
+            delay: delay,
+            options: [.beginFromCurrentState, .allowUserInteraction]
+        ) {
+            self.alpha = targetAlpha
         }
-    }
-
-    private func addCorners() {
-        let length = Self.cornerLength
-        let inset = Self.cornerLineWidth / 2
-        let radius = Self.cornerRadius
-        // 左上角的 L 形，其余三个角镜像得到。
-        let path = CGMutablePath()
-        path.move(to: CGPoint(x: inset, y: length))
-        path.addLine(to: CGPoint(x: inset, y: inset + radius))
-        path.addArc(
-            tangent1End: CGPoint(x: inset, y: inset),
-            tangent2End: CGPoint(x: inset + radius, y: inset),
-            radius: radius
-        )
-        path.addLine(to: CGPoint(x: length, y: inset))
-
-        let far = CGPoint(x: bounds.width - length, y: bounds.height - length)
-        let placements: [(CGAffineTransform, CGPoint, UIView.AutoresizingMask)] = [
-            (.identity, .zero, [.flexibleRightMargin, .flexibleBottomMargin]),
-            (CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: length, ty: 0),
-             CGPoint(x: far.x, y: 0), [.flexibleLeftMargin, .flexibleBottomMargin]),
-            (CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: length),
-             CGPoint(x: 0, y: far.y), [.flexibleRightMargin, .flexibleTopMargin]),
-            (CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: length, ty: length),
-             far, [.flexibleLeftMargin, .flexibleTopMargin])
-        ]
-        for (mirror, origin, mask) in placements {
-            var transform = mirror
-            let shape = CAShapeLayer()
-            shape.path = path.copy(using: &transform)
-            shape.strokeColor = UIColor.systemGreen.cgColor
-            shape.fillColor = nil
-            shape.lineWidth = Self.cornerLineWidth
-            shape.lineCap = .round
-            let corner = UIView(frame: CGRect(origin: origin, size: CGSize(width: length, height: length)))
-            corner.autoresizingMask = mask
-            corner.isUserInteractionEnabled = false
-            corner.layer.addSublayer(shape)
-            corners.addSubview(corner)
-        }
-    }
-}
-
-/// 追踪框右上角的 ×：视觉上 24pt，点击范围扩到 44pt。
-final class TrackingCloseButton: UIButton {
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        var config = UIButton.Configuration.filled()
-        config.image = UIImage(systemName: "xmark")
-        config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 10, weight: .bold)
-        config.baseForegroundColor = .black
-        config.baseBackgroundColor = .white
-        config.cornerStyle = .capsule
-        config.contentInsets = .zero
-        configuration = config
-        layer.shadowColor = UIColor.black.cgColor
-        layer.shadowOpacity = 0.3
-        layer.shadowRadius = 2
-        layer.shadowOffset = .zero
-        accessibilityLabel = "取消追踪对焦"
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        bounds.insetBy(dx: -10, dy: -10).contains(point)
+        guard style == .tracking else { return }
+        // 缩放只加在 layer 上，不改 transform，外框的 frame 动画不受影响。
+        let pulse = CABasicAnimation(keyPath: "transform.scale")
+        pulse.fromValue = 1.08
+        pulse.toValue = 1.0
+        pulse.duration = 0.25
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        pulse.beginTime = CACurrentMediaTime() + delay
+        pulse.fillMode = .backwards
+        layer.add(pulse, forKey: "lockPulse")
     }
 }
