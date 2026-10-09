@@ -309,6 +309,11 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
         }
     }
 
+    /// 点选追踪：只把点交给系统，对焦区域用系统按这个点给的默认大小。
+    func startFocusTracking(at devicePoint: CGPoint) async throws -> CameraState {
+        try await startFocusTracking(in: CGRect(origin: devicePoint, size: .zero))
+    }
+
     /// 框选追踪：系统只跟踪 focusPointOfInterest 处的主体，所以用框中心选主体；
     /// 支持 focusRectOfInterest 时把整个框也传进去，作为主体范围的提示。
     /// 正在追踪时再调用会换成新目标。主体移动、离开再回到画面都会继续跟踪。
@@ -318,9 +323,9 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
             guard #available(iOS 27.0, *), supportsFocusTracking(device),
                   device.isFocusPointOfInterestSupported else { throw CameraError.focusTrackingUnsupported }
             let box = deviceRect.standardized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
-            let center = box.isNull
-                ? CGPoint(x: 0.5, y: 0.5)
-                : CGPoint(x: box.midX, y: box.midY)
+            // 点选时传进来的是零尺寸矩形，求交集可能得到 null，中心点要从原矩形取。
+            let source = box.isNull ? deviceRect.standardized : box
+            let center = CGPoint(x: min(max(source.midX, 0), 1), y: min(max(source.midY, 0), 1))
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
             let isRetarget = isFocusTracking
@@ -343,7 +348,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
             trackedSubjectPresent = nil
             lastExposureUpdate = trackingStartedAt
             lastExposurePoint = center
-            print("[Track] start\(isRetarget ? " (retarget)" : "") box=\(box.trackLogDescription) focus=\(region) exposureFollows=\(exposureFollowsTrackedSubject)")
+            print("[Track] start\(isRetarget ? " (retarget)" : "") box=\(box.isNull ? "none" : box.trackLogDescription) focus=\(region) exposureFollows=\(exposureFollowsTrackedSubject)")
             return makeState()
         }
     }
@@ -731,7 +736,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
 
     /// 调用方需已持有 `lockForConfiguration`；返回实际设置的对焦区域，写进日志方便对比。
     private func applyFocusRegion(_ box: CGRect, center: CGPoint, to device: AVCaptureDevice) -> String {
-        if usesFocusRectForTracking, !box.isNull {
+        if usesFocusRectForTracking, !box.isNull, !box.isEmpty {
             if #available(iOS 26.0, *), device.isFocusRectOfInterestSupported {
                 let minSize = device.minFocusRectOfInterestSize
                 let size = CGSize(

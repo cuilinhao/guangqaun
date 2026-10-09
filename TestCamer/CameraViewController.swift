@@ -51,17 +51,20 @@ final class CameraViewController: UIViewController {
     private let aperturePanel = ApertureControlView()
     /// 追踪期间显示在顶部：「追踪对焦 ×」，目标丢失时换成「目标丢失 ×」。
     private let trackingBadge = UIButton(type: .system)
-    /// 手指拖动时跟手的白框。
-    private let selectionBox = UIView()
-    private var selectionStart: CGPoint = .zero
+    /// 顶部的「追踪对焦」开关：打开后轻点主体开始追踪，关着时轻点是普通对焦。
+    private let trackingToggle = UIButton(type: .system)
+    private var trackingToggleAfterLive: NSLayoutConstraint?
+    private var trackingToggleAfterFlash: NSLayoutConstraint?
+    private var isTrackingModeOn = UserDefaults.standard.bool(forKey: TrackingUI.modeDefaultsKey) {
+        didSet { UserDefaults.standard.set(isTrackingModeOn, forKey: TrackingUI.modeDefaultsKey) }
+    }
     /// 系统样式的黄色细线框：锁定中半透明，锁定后不透明。
     private let trackingFrame = TrackingFrameView(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
     private var trackingPhase: TrackingPhase = .idle
-    /// 每次框选或取消都会加一，用来丢弃过期的异步结果。
+    /// 每次点选或取消都会加一，用来丢弃过期的异步结果。
     private var trackingRequestID = 0
     private var trackingTimeoutTask: Task<Void, Never>?
     private var trackingLostTask: Task<Void, Never>?
-    private var hasShownBoxSelectHint = false
     private let focusHintLabel = PaddedLabel()
     private var focusHintTask: Task<Void, Never>?
 
@@ -387,91 +390,32 @@ private extension CameraViewController {
 
     @objc func handleTapToFocus(_ gesture: UITapGestureRecognizer) {
         guard !isCapturing, !isSwitching, !isChangingMode, cameraState?.isRunning == true else { return }
-        tapFocus(at: gesture.location(in: previewView))
+        let location = gesture.location(in: previewView)
+        if isTrackingModeOn, cameraState?.isFocusTrackingSupported == true {
+            startTracking(at: location)
+        } else {
+            tapFocus(at: location)
+        }
     }
 
-    /// 单击对焦；正在追踪或锁定中会先取消追踪。
+    /// 普通单击对焦；万一还在追踪，先取消。
     func tapFocus(at location: CGPoint) {
         let devicePoint = previewView.previewLayer.captureDevicePointConverted(fromLayerPoint: location)
-        let wasTracking = trackingPhase.isActive
         resetTrackingUI()
         camera.focus(at: devicePoint)
         showFocusIndicator(at: location)
-        if !wasTracking, !hasShownBoxSelectHint, cameraState?.isFocusTrackingSupported == true {
-            hasShownBoxSelectHint = true
-            showFocusHint("拖动框选主体以追踪对焦")
-        }
     }
 
-    /// 单指拖出一个框，松手后追踪框里的主体；正在追踪时会换成新目标。
-    @objc func handleBoxSelect(_ gesture: UIPanGestureRecognizer) {
-        switch gesture.state {
-        case .began:
-            guard !isCapturing, !isSwitching, !isChangingMode, cameraState?.isRunning == true else {
-                cancelGesture(gesture)
-                return
-            }
-            // 平移手势要移动一小段才会识别，框的起点要退回手指按下的位置。
-            let location = gesture.location(in: previewView)
-            let translation = gesture.translation(in: previewView)
-            selectionStart = CGPoint(x: location.x - translation.x, y: location.y - translation.y)
-            if isAperturePanelShown {
-                setAperturePanelShown(false)
-            }
-            hideFocusHint()
-            selectionBox.frame = selectionRect(to: location)
-            selectionBox.isHidden = false
-        case .changed:
-            guard gesture.numberOfTouches <= 1 else {
-                // 第二根手指落下多半是想缩放，放弃这次框选。
-                cancelGesture(gesture)
-                return
-            }
-            selectionBox.frame = selectionRect(to: gesture.location(in: previewView))
-        case .ended:
-            selectionBox.isHidden = true
-            finishBoxSelection(selectionRect(to: gesture.location(in: previewView)))
-        default:
-            selectionBox.isHidden = true
-        }
-    }
-
-    func cancelGesture(_ gesture: UIGestureRecognizer) {
-        gesture.isEnabled = false
-        gesture.isEnabled = true
-    }
-
-    func selectionRect(to point: CGPoint) -> CGRect {
-        let rect = CGRect(
-            x: min(selectionStart.x, point.x),
-            y: min(selectionStart.y, point.y),
-            width: abs(point.x - selectionStart.x),
-            height: abs(point.y - selectionStart.y)
-        )
-        let visible = rect.intersection(previewView.bounds)
-        return visible.isNull ? CGRect(origin: selectionStart, size: .zero) : visible
-    }
-
-    func finishBoxSelection(_ box: CGRect) {
-        guard !isCapturing, !isSwitching, !isChangingMode, cameraState?.isRunning == true else { return }
-        let center = CGPoint(x: box.midX, y: box.midY)
-        // 框太小多半是手指抖了一下，当成单击对焦。
-        guard min(box.width, box.height) >= TrackingUI.minSelectionSide else {
-            tapFocus(at: center)
-            return
-        }
-        guard cameraState?.isFocusTrackingSupported == true else {
-            tapFocus(at: center)
-            showFocusHint("当前镜头不支持追踪对焦")
-            return
-        }
-        startTracking(in: box)
-    }
-
-    func startTracking(in box: CGRect) {
+    /// 轻点开始追踪点下的主体；正在追踪时会换成新目标。
+    func startTracking(at location: CGPoint) {
         trackingRequestID += 1
         let requestID = trackingRequestID
-        let deviceRect = previewView.previewLayer.metadataOutputRectConverted(fromLayerRect: box)
+        let devicePoint = previewView.previewLayer.captureDevicePointConverted(fromLayerPoint: location)
+        let side = TrackingUI.tapBoxSide
+        let box = CGRect(x: location.x - side / 2, y: location.y - side / 2, width: side, height: side)
+        if isAperturePanelShown {
+            setAperturePanelShown(false)
+        }
         hideFocusHint()
         trackingFrame.setStyle(.locking, animated: false)
         moveTrackingFrame(to: box, duration: 0)
@@ -484,11 +428,11 @@ private extension CameraViewController {
         }
         Task {
             do {
-                let state = try await camera.startFocusTracking(in: deviceRect)
+                let state = try await camera.startFocusTracking(at: devicePoint)
                 if requestID == trackingRequestID {
                     cameraState = state
                 } else if let latest = try? await camera.currentState() {
-                    // 等待期间用户已经单击或取消，以相机最新状态为准。
+                    // 等待期间用户已经取消或关掉开关，以相机最新状态为准。
                     cameraState = latest
                 }
             } catch {
@@ -506,7 +450,7 @@ private extension CameraViewController {
         }
     }
 
-    /// 等了一段时间系统还没锁定主体（比如框的是一面白墙），退回普通对焦。
+    /// 等了一段时间系统还没锁定主体（比如点的是一面白墙），退回普通对焦。
     func handleLockTimeout(requestID: Int) {
         guard case .locking(let id, let box, _) = trackingPhase, id == requestID else { return }
         print("[Track] lock timeout, fall back to tap focus")
@@ -514,17 +458,36 @@ private extension CameraViewController {
         resetTrackingUI()
         camera.focus(at: previewView.previewLayer.captureDevicePointConverted(fromLayerPoint: center))
         showFocusIndicator(at: center)
-        showFocusHint("未能锁定目标，请重新框选")
+        showFocusHint("未能锁定目标，请重新点选")
     }
 
     @objc func cancelFocusTrackingTapped() {
         UISelectionFeedbackGenerator().selectionChanged()
+        stopTracking()
+    }
+
+    func stopTracking() {
         resetTrackingUI()
         Task {
             if let state = try? await camera.stopFocusTracking() {
                 cameraState = state
             }
         }
+    }
+
+    @objc func trackingToggleTapped() {
+        guard cameraState?.isFocusTrackingSupported == true else { return }
+        isTrackingModeOn.toggle()
+        UISelectionFeedbackGenerator().selectionChanged()
+        if isTrackingModeOn {
+            showFocusHint("轻点主体开始追踪对焦")
+        } else {
+            hideFocusHint()
+            if trackingPhase.isActive {
+                stopTracking()
+            }
+        }
+        updateControlAvailability()
     }
 
     @objc func apertureButtonTapped() {
@@ -632,6 +595,9 @@ private extension CameraViewController {
         configureIconButton(liveButton, systemName: "livephoto.slash", action: #selector(liveTapped))
         liveButton.accessibilityLabel = "实况照片"
         view.addSubview(liveButton)
+        configureIconButton(trackingToggle, systemName: "dot.viewfinder", action: #selector(trackingToggleTapped))
+        trackingToggle.accessibilityLabel = "追踪对焦"
+        view.addSubview(trackingToggle)
         configureIconButton(switchButton, systemName: "camera.rotate.fill", action: #selector(switchTapped))
         switchButton.accessibilityLabel = "切换摄像头"
 
@@ -661,9 +627,6 @@ private extension CameraViewController {
 
         previewView.addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:))))
         previewView.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(handleTapToFocus(_:))))
-        let boxSelect = UIPanGestureRecognizer(target: self, action: #selector(handleBoxSelect(_:)))
-        boxSelect.maximumNumberOfTouches = 1
-        previewView.addGestureRecognizer(boxSelect)
         configureFocusTrackingViews()
 
         NSLayoutConstraint.activate([
@@ -772,19 +735,8 @@ private extension CameraViewController {
     }
 
     func configureFocusTrackingViews() {
-        // 层级：追踪框在拖动白框下面，换目标时白框画在旧框上面。
         trackingFrame.isHidden = true
         previewView.addSubview(trackingFrame)
-
-        selectionBox.layer.borderColor = UIColor.white.cgColor
-        selectionBox.layer.borderWidth = 1.5
-        selectionBox.layer.shadowColor = UIColor.black.cgColor
-        selectionBox.layer.shadowOpacity = 0.3
-        selectionBox.layer.shadowRadius = 1.5
-        selectionBox.layer.shadowOffset = .zero
-        selectionBox.isUserInteractionEnabled = false
-        selectionBox.isHidden = true
-        previewView.addSubview(selectionBox)
 
         var badgeConfig = UIButton.Configuration.filled()
         badgeConfig.attributedTitle = AttributedString(
@@ -816,7 +768,15 @@ private extension CameraViewController {
         focusHintLabel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(focusHintLabel)
 
+        // 照片模式排在实况后面；视频模式实况隐藏，挪到实况的位置。
+        trackingToggleAfterLive = trackingToggle.leadingAnchor.constraint(equalTo: liveButton.trailingAnchor, constant: 4)
+        trackingToggleAfterFlash = trackingToggle.leadingAnchor.constraint(equalTo: flashButton.trailingAnchor, constant: 4)
+        trackingToggleAfterLive?.isActive = true
+
         NSLayoutConstraint.activate([
+            trackingToggle.centerYAnchor.constraint(equalTo: flashButton.centerYAnchor),
+            trackingToggle.widthAnchor.constraint(equalToConstant: 48),
+            trackingToggle.heightAnchor.constraint(equalToConstant: 48),
             trackingBadge.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             trackingBadge.topAnchor.constraint(equalTo: flashButton.bottomAnchor, constant: 8),
             focusHintLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -848,7 +808,7 @@ private extension CameraViewController {
         case .idle:
             return
         case .locking(_, let box, let startedAt):
-            // 换目标时系统可能还在报旧主体，只认和用户画的框有交集的结果。
+            // 换目标时系统可能还在报旧主体，只认和点击位置的框有交集的结果。
             guard let rect, rect.intersects(box.insetBy(dx: -24, dy: -24)) else { return }
             let elapsed = Date().timeIntervalSince(startedAt)
             print("[Track] locked after \(Int(elapsed * 1000))ms")
@@ -1245,6 +1205,26 @@ private extension CameraViewController {
         flashButton.configuration?.baseForegroundColor = flashMode == .off ? .white : .systemYellow
     }
 
+    /// 当前镜头不支持追踪时开关变灰，但保留用户的选择，切回支持的镜头后恢复。
+    func updateTrackingToggle(ready: Bool) {
+        let supported = cameraState?.isFocusTrackingSupported == true
+        let isOn = isTrackingModeOn && supported
+        trackingToggle.isEnabled = (ready || isRecording) && supported
+        trackingToggle.alpha = supported ? 1 : 0.35
+        trackingToggle.configuration?.baseForegroundColor = isOn ? .systemYellow : .white
+        trackingToggle.accessibilityValue = isOn ? "已开启" : "已关闭"
+        let afterLive = captureMode == .photo
+        if trackingToggleAfterLive?.isActive != afterLive {
+            trackingToggleAfterLive?.isActive = false
+            trackingToggleAfterFlash?.isActive = false
+            if afterLive {
+                trackingToggleAfterLive?.isActive = true
+            } else {
+                trackingToggleAfterFlash?.isActive = true
+            }
+        }
+    }
+
     func updateLiveButton(ready: Bool) {
         let supported = captureMode == .photo && cameraState?.isLivePhotoSupported == true
         let isOn = supported && cameraState?.isLivePhotoEnabled == true
@@ -1341,6 +1321,7 @@ private extension CameraViewController {
         apertureButton.alpha = apertureEnabled ? 1 : 0.5
         aperturePanel.isUserInteractionEnabled = apertureEnabled
         updateLiveButton(ready: ready)
+        updateTrackingToggle(ready: ready)
         updateFlashButton()
         flashButton.isEnabled = ready && captureMode == .photo
             && cameraState?.hasFlash == true && cameraState?.isFront == false
@@ -1385,7 +1366,7 @@ final class PreviewView: UIView {
 
 private enum TrackingPhase {
     case idle
-    /// 已发起追踪，等系统锁定主体；`box` 是用户画的框（预览坐标）。
+    /// 已发起追踪，等系统锁定主体；`box` 是点击位置的框（预览坐标）。
     case locking(requestID: Int, box: CGRect, startedAt: Date)
     case tracking
     /// 系统仍在追踪，但主体暂时不在画面里。
@@ -1398,8 +1379,10 @@ private enum TrackingPhase {
 }
 
 private enum TrackingUI {
-    /// 短边小于这个值的框当成单击对焦。
-    static let minSelectionSide: CGFloat = 40
+    /// 「追踪对焦」开关状态存在 UserDefaults 里，下次打开 App 保持。
+    static let modeDefaultsKey = "TestCamer.focusTrackingModeOn"
+    /// 轻点后、锁定前显示在点击位置的半透明框边长。
+    static let tapBoxSide: CGFloat = 90
     /// 超过这个时间还没锁定主体，就退回普通对焦。
     static let lockTimeout: Duration = .seconds(1)
     /// 锁定中的半透明框至少显示这么久，再变成锁定样式。
@@ -1411,7 +1394,7 @@ private enum TrackingUI {
 }
 
 /// 追踪框，样式对齐系统相机：黄色 1pt 细线、6pt 圆角。
-/// 锁定中半透明停在用户画的框上；锁定后变成不透明，并像系统对焦框那样轻轻缩一下。
+/// 锁定中半透明停在点击位置；锁定后变成不透明，并像系统对焦框那样轻轻缩一下。
 final class TrackingFrameView: UIView {
     enum Style {
         case locking
