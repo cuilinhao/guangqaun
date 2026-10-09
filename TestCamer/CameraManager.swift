@@ -54,6 +54,15 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
     private let movieOutput = AVCaptureMovieFileOutput()
     private let metadataOutput = AVCaptureMetadataOutput()
     private var isFocusTracking = false
+    /// 关掉后只用框中心点选主体，用来对比把整个框传给系统是否让追踪更准。
+    private let usesFocusRectForTracking = true
+    /// 关掉后曝光只在开始追踪时设一次，用来排查曝光跟随是否干扰追踪。
+    private let exposureFollowsTrackedSubject = true
+    private var trackingStartedAt: CFAbsoluteTime = 0
+    /// nil 表示本次追踪还没收到过 metadata；只在主体出现、消失时打日志。
+    private var trackedSubjectPresent: Bool?
+    private var lastExposureUpdate: CFAbsoluteTime = 0
+    private var lastExposurePoint = CGPoint(x: 0.5, y: 0.5)
     private var deviceInput: AVCaptureDeviceInput?
     private var audioInput: AVCaptureDeviceInput?
     private var mode: CaptureMode = .photo
@@ -124,6 +133,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
     func stop() {
         sessionQueue.async { [self] in
             wantsToRun = false
+            endFocusTrackingIfNeeded(reason: "session stop")
             if let pending = pendingCapture {
                 finishCapture(id: pending.id, result: .failure(CameraError.interrupted))
             }
@@ -299,24 +309,41 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
         }
     }
 
-    /// 锁定 `devicePoint` 处的物体持续对焦；物体移动、离开再回到画面都会继续跟踪。
-    func startFocusTracking(at devicePoint: CGPoint) async throws -> CameraState {
+    /// 框选追踪：系统只跟踪 focusPointOfInterest 处的主体，所以用框中心选主体；
+    /// 支持 focusRectOfInterest 时把整个框也传进去，作为主体范围的提示。
+    /// 正在追踪时再调用会换成新目标。主体移动、离开再回到画面都会继续跟踪。
+    func startFocusTracking(in deviceRect: CGRect) async throws -> CameraState {
         try await onSessionQueue { [self] in
             guard pendingCapture == nil, let device = deviceInput?.device else { throw CameraError.busy }
             guard #available(iOS 27.0, *), supportsFocusTracking(device),
                   device.isFocusPointOfInterestSupported else { throw CameraError.focusTrackingUnsupported }
+            let box = deviceRect.standardized.intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+            let center = box.isNull
+                ? CGPoint(x: 0.5, y: 0.5)
+                : CGPoint(x: box.midX, y: box.midY)
             try device.lockForConfiguration()
             defer { device.unlockForConfiguration() }
+            let isRetarget = isFocusTracking
+            if isRetarget {
+                // 不先停掉旧的追踪，系统会继续跟原来的主体。
+                device.isContinuousAutoFocusTrackingEnabled = false
+                device.focusMode = .continuousAutoFocus
+            }
             // 跟踪期间 focusPointOfInterest 不会更新，主体区域变化时重设对焦会把目标拉回起点。
             device.isSubjectAreaChangeMonitoringEnabled = false
             device.isContinuousAutoFocusTrackingEnabled = true
-            device.focusPointOfInterest = devicePoint
+            let region = applyFocusRegion(box, center: center, to: device)
             device.focusMode = .continuousAutoFocus
             if device.isExposurePointOfInterestSupported {
-                device.exposurePointOfInterest = devicePoint
+                device.exposurePointOfInterest = center
                 _ = applyExposureMode(to: device)
             }
             isFocusTracking = true
+            trackingStartedAt = CFAbsoluteTimeGetCurrent()
+            trackedSubjectPresent = nil
+            lastExposureUpdate = trackingStartedAt
+            lastExposurePoint = center
+            print("[Track] start\(isRetarget ? " (retarget)" : "") box=\(box.trackLogDescription) focus=\(region) exposureFollows=\(exposureFollowsTrackedSubject)")
             return makeState()
         }
     }
@@ -326,18 +353,10 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
             if let device = deviceInput?.device {
                 try device.lockForConfiguration()
                 defer { device.unlockForConfiguration() }
-                disableFocusTracking(on: device)
-                let center = CGPoint(x: 0.5, y: 0.5)
-                if device.isFocusPointOfInterestSupported {
-                    device.focusPointOfInterest = center
+                if isFocusTracking {
+                    print("[Track] stop (user cancel)")
                 }
-                if device.isFocusModeSupported(.continuousAutoFocus) {
-                    device.focusMode = .continuousAutoFocus
-                }
-                if device.isExposurePointOfInterestSupported {
-                    device.exposurePointOfInterest = center
-                    _ = applyExposureMode(to: device)
-                }
+                resetFocusAfterTracking(on: device)
             }
             return makeState()
         }
@@ -351,7 +370,55 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
         dispatchPrecondition(condition: .onQueue(sessionQueue))
         guard #available(iOS 27.0, *), isFocusTracking else { return }
         let tracked = metadataObjects.first { $0.type == .focusTrackedObject }
-        eventHandler?(.focusTrackedObject(tracked?.bounds))
+        let bounds = tracked?.bounds
+        logTrackedSubjectChange(bounds)
+        if let bounds {
+            followExposure(to: bounds)
+        }
+        eventHandler?(.focusTrackedObject(bounds))
+    }
+
+    /// 只在主体首次出现、丢失、回来时打日志，避免每帧刷屏。
+    @available(iOS 27.0, *)
+    private func logTrackedSubjectChange(_ bounds: CGRect?) {
+        let present = bounds != nil
+        guard present != trackedSubjectPresent else { return }
+        let elapsed = Int((CFAbsoluteTimeGetCurrent() - trackingStartedAt) * 1000)
+        let acquired = deviceInput?.device.isContinuousAutoFocusTrackingSubjectAcquired ?? false
+        let event: String
+        switch (trackedSubjectPresent, present) {
+        case (nil, true):
+            event = "first subject"
+        case (nil, false):
+            event = "no subject yet"
+        case (_, true):
+            event = "subject back"
+        case (_, false):
+            event = "subject lost"
+        }
+        print("[Track] \(event) at +\(elapsed)ms bounds=\(bounds?.trackLogDescription ?? "nil") acquired=\(acquired)")
+        trackedSubjectPresent = present
+    }
+
+    /// 追踪期间让测光点跟着主体走；限频并忽略小幅移动，避免亮度来回闪。
+    private func followExposure(to bounds: CGRect) {
+        guard exposureFollowsTrackedSubject, pendingCapture == nil,
+              let device = deviceInput?.device, device.isExposurePointOfInterestSupported else { return }
+        let point = CGPoint(x: min(max(bounds.midX, 0), 1), y: min(max(bounds.midY, 0), 1))
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastExposureUpdate >= 0.3,
+              hypot(point.x - lastExposurePoint.x, point.y - lastExposurePoint.y) >= 0.03 else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.exposurePointOfInterest = point
+            _ = applyExposureMode(to: device)
+            lastExposureUpdate = now
+            lastExposurePoint = point
+            print("[Track] exposure -> \(String(format: "(%.3f, %.3f)", point.x, point.y))")
+        } catch {
+            print("[Track] exposure rejected: \(error.localizedDescription)")
+        }
     }
 
     func focus(at devicePoint: CGPoint) {
@@ -363,6 +430,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
                 let wasTracking = isFocusTracking
                 disableFocusTracking(on: device)
                 if wasTracking {
+                    print("[Track] stop (tap to focus)")
                     eventHandler?(.ready(makeState()))
                 }
                 if device.isFocusPointOfInterestSupported, device.isFocusModeSupported(.autoFocus) {
@@ -582,6 +650,9 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
 
         try device.lockForConfiguration()
         defer { device.unlockForConfiguration() }
+        if isFocusTracking {
+            print("[Track] stop (camera reconfigured)")
+        }
         disableFocusTracking(on: device)
         if device.isFocusModeSupported(.continuousAutoFocus) {
             device.focusMode = .continuousAutoFocus
@@ -622,6 +693,63 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
         isFocusTracking = false
         guard #available(iOS 27.0, *), device.isContinuousAutoFocusTrackingEnabled else { return }
         device.isContinuousAutoFocusTrackingEnabled = false
+    }
+
+    /// 调用方需已持有 `lockForConfiguration`。
+    private func resetFocusAfterTracking(on device: AVCaptureDevice) {
+        disableFocusTracking(on: device)
+        let center = CGPoint(x: 0.5, y: 0.5)
+        if device.isFocusPointOfInterestSupported {
+            device.focusPointOfInterest = center
+        }
+        if device.isFocusModeSupported(.continuousAutoFocus) {
+            device.focusMode = .continuousAutoFocus
+        }
+        if device.isExposurePointOfInterestSupported {
+            device.exposurePointOfInterest = center
+            _ = applyExposureMode(to: device)
+        }
+    }
+
+    /// 离开相机页、进后台或被系统打断时结束追踪，回来后界面和设备状态一致。
+    private func endFocusTrackingIfNeeded(reason: String) {
+        guard isFocusTracking else { return }
+        print("[Track] stop (\(reason))")
+        guard let device = deviceInput?.device else {
+            isFocusTracking = false
+            return
+        }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            resetFocusAfterTracking(on: device)
+        } catch {
+            isFocusTracking = false
+            print("[Track] stop rejected: \(error.localizedDescription)")
+        }
+    }
+
+    /// 调用方需已持有 `lockForConfiguration`；返回实际设置的对焦区域，写进日志方便对比。
+    private func applyFocusRegion(_ box: CGRect, center: CGPoint, to device: AVCaptureDevice) -> String {
+        if usesFocusRectForTracking, !box.isNull {
+            if #available(iOS 26.0, *), device.isFocusRectOfInterestSupported {
+                let minSize = device.minFocusRectOfInterestSize
+                let size = CGSize(
+                    width: min(max(box.width, minSize.width), 1),
+                    height: min(max(box.height, minSize.height), 1)
+                )
+                let origin = CGPoint(
+                    x: min(max(center.x - size.width / 2, 0), 1 - size.width),
+                    y: min(max(center.y - size.height / 2, 0), 1 - size.height)
+                )
+                let region = CGRect(origin: origin, size: size)
+                device.focusRectOfInterest = region
+                let minText = String(format: "%.3f×%.3f", minSize.width, minSize.height)
+                return "rect \(region.trackLogDescription) min=\(minText)"
+            }
+        }
+        device.focusPointOfInterest = center
+        return "point " + String(format: "(%.3f, %.3f)", center.x, center.y)
     }
 
     /// 视频预设选出的格式不一定带可变光圈；此时换成尺寸最接近、支持光圈且能跑 30fps 的格式。
@@ -814,6 +942,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
                 if let pending = self.pendingCapture {
                     self.finishCapture(id: pending.id, result: .failure(CameraError.interrupted))
                 }
+                self.endFocusTrackingIfNeeded(reason: "interrupted")
                 self.eventHandler?(.interrupted)
             }
         })
@@ -876,5 +1005,12 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
                 }
             }
         })
+    }
+}
+
+extension CGRect {
+    /// `[Track]` 日志里的归一化矩形，保留三位小数方便对比。
+    var trackLogDescription: String {
+        String(format: "(%.3f, %.3f, %.3f×%.3f)", origin.x, origin.y, width, height)
     }
 }

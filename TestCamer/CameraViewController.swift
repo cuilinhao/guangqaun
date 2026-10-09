@@ -49,8 +49,20 @@ final class CameraViewController: UIViewController {
     private let apertureButton = UIButton(type: .system)
     private let apertureIndicator = UIButton(type: .system)
     private let aperturePanel = ApertureControlView()
+    /// 只在目标丢失时出现：「目标丢失 ×」。
     private let trackingBadge = UIButton(type: .system)
-    private let trackingBox = UIView()
+    /// 手指拖动时跟手的白框。
+    private let selectionBox = UIView()
+    private var selectionStart: CGPoint = .zero
+    /// 锁定中是红色整框，追踪中是绿色四角。
+    private let trackingFrame = TrackingFrameView(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
+    private let trackingCloseButton = TrackingCloseButton(frame: CGRect(x: 0, y: 0, width: 24, height: 24))
+    private var trackingPhase: TrackingPhase = .idle
+    /// 每次框选或取消都会加一，用来丢弃过期的异步结果。
+    private var trackingRequestID = 0
+    private var trackingTimeoutTask: Task<Void, Never>?
+    private var trackingLostTask: Task<Void, Never>?
+    private var hasShownBoxSelectHint = false
     private let focusHintLabel = PaddedLabel()
     private var focusHintTask: Task<Void, Never>?
 
@@ -172,7 +184,7 @@ private extension CameraViewController {
             updateApertureUI()
             return
         case .focusTrackedObject(let rect):
-            updateTrackingBox(metadataRect: rect)
+            handleTrackedObject(metadataRect: rect)
             return
         case .interrupted:
             cameraState = nil
@@ -376,45 +388,143 @@ private extension CameraViewController {
 
     @objc func handleTapToFocus(_ gesture: UITapGestureRecognizer) {
         guard !isCapturing, !isSwitching, !isChangingMode, cameraState?.isRunning == true else { return }
-        let location = gesture.location(in: previewView)
+        tapFocus(at: gesture.location(in: previewView))
+    }
+
+    /// 单击对焦；正在追踪或锁定中会先取消追踪。
+    func tapFocus(at location: CGPoint) {
         let devicePoint = previewView.previewLayer.captureDevicePointConverted(fromLayerPoint: location)
-        let wasTracking = cameraState?.isFocusTracking == true
+        let wasTracking = trackingPhase.isActive
+        resetTrackingUI()
         camera.focus(at: devicePoint)
         showFocusIndicator(at: location)
-        if wasTracking {
-            trackingBox.isHidden = true
-        } else if cameraState?.isFocusTrackingSupported == true {
-            showFocusHint("轻点两下以追踪对焦")
+        if !wasTracking, !hasShownBoxSelectHint, cameraState?.isFocusTrackingSupported == true {
+            hasShownBoxSelectHint = true
+            showFocusHint("拖动框选主体以追踪对焦")
         }
     }
 
-    @objc func handleDoubleTapToTrack(_ gesture: UITapGestureRecognizer) {
+    /// 单指拖出一个框，松手后追踪框里的主体；正在追踪时会换成新目标。
+    @objc func handleBoxSelect(_ gesture: UIPanGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            guard !isCapturing, !isSwitching, !isChangingMode, cameraState?.isRunning == true else {
+                cancelGesture(gesture)
+                return
+            }
+            // 平移手势要移动一小段才会识别，框的起点要退回手指按下的位置。
+            let location = gesture.location(in: previewView)
+            let translation = gesture.translation(in: previewView)
+            selectionStart = CGPoint(x: location.x - translation.x, y: location.y - translation.y)
+            if isAperturePanelShown {
+                setAperturePanelShown(false)
+            }
+            hideFocusHint()
+            selectionBox.frame = selectionRect(to: location)
+            selectionBox.isHidden = false
+        case .changed:
+            guard gesture.numberOfTouches <= 1 else {
+                // 第二根手指落下多半是想缩放，放弃这次框选。
+                cancelGesture(gesture)
+                return
+            }
+            selectionBox.frame = selectionRect(to: gesture.location(in: previewView))
+        case .ended:
+            selectionBox.isHidden = true
+            finishBoxSelection(selectionRect(to: gesture.location(in: previewView)))
+        default:
+            selectionBox.isHidden = true
+        }
+    }
+
+    func cancelGesture(_ gesture: UIGestureRecognizer) {
+        gesture.isEnabled = false
+        gesture.isEnabled = true
+    }
+
+    func selectionRect(to point: CGPoint) -> CGRect {
+        let rect = CGRect(
+            x: min(selectionStart.x, point.x),
+            y: min(selectionStart.y, point.y),
+            width: abs(point.x - selectionStart.x),
+            height: abs(point.y - selectionStart.y)
+        )
+        let visible = rect.intersection(previewView.bounds)
+        return visible.isNull ? CGRect(origin: selectionStart, size: .zero) : visible
+    }
+
+    func finishBoxSelection(_ box: CGRect) {
         guard !isCapturing, !isSwitching, !isChangingMode, cameraState?.isRunning == true else { return }
-        guard cameraState?.isFocusTrackingSupported == true else {
-            handleTapToFocus(gesture)
+        let center = CGPoint(x: box.midX, y: box.midY)
+        // 框太小多半是手指抖了一下，当成单击对焦。
+        guard min(box.width, box.height) >= TrackingUI.minSelectionSide else {
+            tapFocus(at: center)
             return
         }
-        let location = gesture.location(in: previewView)
-        let devicePoint = previewView.previewLayer.captureDevicePointConverted(fromLayerPoint: location)
-        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        guard cameraState?.isFocusTrackingSupported == true else {
+            tapFocus(at: center)
+            showFocusHint("当前镜头不支持追踪对焦")
+            return
+        }
+        startTracking(in: box)
+    }
+
+    func startTracking(in box: CGRect) {
+        trackingRequestID += 1
+        let requestID = trackingRequestID
+        let deviceRect = previewView.previewLayer.metadataOutputRectConverted(fromLayerRect: box)
         hideFocusHint()
-        trackingBox.frame = CGRect(x: location.x - 45, y: location.y - 45, width: 90, height: 90)
-        trackingBox.isHidden = false
+        trackingFrame.setStyle(.locking, animated: false)
+        moveTrackingFrame(to: box, duration: 0)
+        setTrackingPhase(.locking(requestID: requestID, box: box, startedAt: Date()))
+        trackingTimeoutTask?.cancel()
+        trackingTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: TrackingUI.lockTimeout)
+            guard !Task.isCancelled else { return }
+            self?.handleLockTimeout(requestID: requestID)
+        }
         Task {
             do {
-                cameraState = try await camera.startFocusTracking(at: devicePoint)
+                let state = try await camera.startFocusTracking(in: deviceRect)
+                if requestID == trackingRequestID {
+                    cameraState = state
+                } else if let latest = try? await camera.currentState() {
+                    // 等待期间用户已经单击或取消，以相机最新状态为准。
+                    cameraState = latest
+                }
             } catch {
-                cameraState = try? await camera.currentState()
-                presentError(error)
+                if let latest = try? await camera.currentState() {
+                    cameraState = latest
+                }
+                guard requestID == trackingRequestID else { return }
+                resetTrackingUI()
+                if let cameraError = error as? CameraError, cameraError == .focusTrackingUnsupported {
+                    showFocusHint("当前镜头不支持追踪对焦")
+                } else {
+                    presentError(error)
+                }
             }
         }
     }
 
+    /// 等了一段时间系统还没锁定主体（比如框的是一面白墙），退回普通对焦。
+    func handleLockTimeout(requestID: Int) {
+        guard case .locking(let id, let box, _) = trackingPhase, id == requestID else { return }
+        print("[Track] lock timeout, fall back to tap focus")
+        let center = CGPoint(x: box.midX, y: box.midY)
+        resetTrackingUI()
+        camera.focus(at: previewView.previewLayer.captureDevicePointConverted(fromLayerPoint: center))
+        showFocusIndicator(at: center)
+        showFocusHint("未能锁定目标，请重新框选")
+    }
+
     @objc func cancelFocusTrackingTapped() {
         UISelectionFeedbackGenerator().selectionChanged()
-        trackingBox.isHidden = true
+        resetTrackingUI()
         Task {
-            cameraState = try? await camera.stopFocusTracking()
+            if let state = try? await camera.stopFocusTracking() {
+                cameraState = state
+            }
         }
     }
 
@@ -551,12 +661,10 @@ private extension CameraViewController {
         previewView.addSubview(focusIndicator)
 
         previewView.addGestureRecognizer(UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:))))
-        let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTapToTrack(_:)))
-        doubleTap.numberOfTapsRequired = 2
-        let singleTap = UITapGestureRecognizer(target: self, action: #selector(handleTapToFocus(_:)))
-        singleTap.require(toFail: doubleTap)
-        previewView.addGestureRecognizer(doubleTap)
-        previewView.addGestureRecognizer(singleTap)
+        previewView.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(handleTapToFocus(_:))))
+        let boxSelect = UIPanGestureRecognizer(target: self, action: #selector(handleBoxSelect(_:)))
+        boxSelect.maximumNumberOfTouches = 1
+        previewView.addGestureRecognizer(boxSelect)
         configureFocusTrackingViews()
 
         NSLayoutConstraint.activate([
@@ -665,17 +773,27 @@ private extension CameraViewController {
     }
 
     func configureFocusTrackingViews() {
-        trackingBox.layer.borderColor = UIColor.systemYellow.cgColor
-        trackingBox.layer.borderWidth = 1.5
-        trackingBox.layer.cornerRadius = 8
-        trackingBox.layer.cornerCurve = .continuous
-        trackingBox.isUserInteractionEnabled = false
-        trackingBox.isHidden = true
-        previewView.addSubview(trackingBox)
+        // 层级：追踪框 < 拖动白框 < ×，换目标时白框画在旧的绿框上面。
+        trackingFrame.isHidden = true
+        previewView.addSubview(trackingFrame)
+
+        selectionBox.layer.borderColor = UIColor.white.cgColor
+        selectionBox.layer.borderWidth = 1.5
+        selectionBox.layer.shadowColor = UIColor.black.cgColor
+        selectionBox.layer.shadowOpacity = 0.3
+        selectionBox.layer.shadowRadius = 1.5
+        selectionBox.layer.shadowOffset = .zero
+        selectionBox.isUserInteractionEnabled = false
+        selectionBox.isHidden = true
+        previewView.addSubview(selectionBox)
+
+        trackingCloseButton.isHidden = true
+        trackingCloseButton.addTarget(self, action: #selector(cancelFocusTrackingTapped), for: .touchUpInside)
+        previewView.addSubview(trackingCloseButton)
 
         var badgeConfig = UIButton.Configuration.filled()
         badgeConfig.attributedTitle = AttributedString(
-            "追踪对焦",
+            "目标丢失",
             attributes: AttributeContainer([.font: UIFont.systemFont(ofSize: 14, weight: .semibold)])
         )
         badgeConfig.image = UIImage(systemName: "xmark.circle.fill")
@@ -683,11 +801,11 @@ private extension CameraViewController {
         badgeConfig.imagePlacement = .trailing
         badgeConfig.imagePadding = 6
         badgeConfig.cornerStyle = .capsule
-        badgeConfig.baseForegroundColor = .black
-        badgeConfig.baseBackgroundColor = .systemYellow
+        badgeConfig.baseForegroundColor = .white
+        badgeConfig.baseBackgroundColor = UIColor.black.withAlphaComponent(0.55)
         badgeConfig.contentInsets = NSDirectionalEdgeInsets(top: 5, leading: 12, bottom: 5, trailing: 8)
         trackingBadge.configuration = badgeConfig
-        trackingBadge.accessibilityLabel = "取消追踪对焦"
+        trackingBadge.accessibilityLabel = "目标丢失，取消追踪对焦"
         trackingBadge.translatesAutoresizingMaskIntoConstraints = false
         trackingBadge.isHidden = true
         trackingBadge.addTarget(self, action: #selector(cancelFocusTrackingTapped), for: .touchUpInside)
@@ -711,34 +829,146 @@ private extension CameraViewController {
         ])
     }
 
+    /// 相机重新配置（切换镜头或模式）、停止或被打断后系统那边的追踪已经结束，界面跟着收起。
     func updateFocusTrackingUI() {
-        let isTracking = cameraState?.isFocusTracking == true
-        trackingBadge.isHidden = !isTracking
-        if !isTracking {
-            trackingBox.isHidden = true
+        switch trackingPhase {
+        case .idle:
+            return
+        case .locking:
+            // 锁定请求还在路上时，状态里可能还没标记追踪；只在相机不可用时收起。
+            if cameraState == nil {
+                resetTrackingUI()
+            }
+        case .tracking, .lost:
+            if cameraState?.isFocusTracking != true {
+                resetTrackingUI()
+            }
         }
     }
 
-    func updateTrackingBox(metadataRect: CGRect?) {
-        guard cameraState?.isFocusTracking == true else { return }
-        guard let metadataRect else {
-            trackingBox.isHidden = true
+    /// 系统回调被追踪主体的位置；nil 表示主体不在画面里。
+    func handleTrackedObject(metadataRect: CGRect?) {
+        let rect = metadataRect.map { trackingDisplayRect(forMetadataRect: $0) }
+        switch trackingPhase {
+        case .idle:
             return
+        case .locking(_, let box, let startedAt):
+            // 换目标时系统可能还在报旧主体，只认和用户画的框有交集的结果。
+            guard let rect, rect.intersects(box.insetBy(dx: -24, dy: -24)) else { return }
+            let elapsed = Date().timeIntervalSince(startedAt)
+            print("[Track] locked after \(Int(elapsed * 1000))ms")
+            setTrackingPhase(.tracking)
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            // 系统锁得很快时也让红框停留一下，看得出「锁定中 → 已锁定」。
+            trackingFrame.setStyle(.tracking, animated: true, delay: max(0, TrackingUI.minLockingDisplay - elapsed))
+            moveTrackingFrame(to: rect, duration: 0.15)
+        case .tracking:
+            guard let rect else {
+                scheduleTrackingLost()
+                return
+            }
+            trackingLostTask?.cancel()
+            trackingLostTask = nil
+            moveTrackingFrame(to: rect, duration: 0.1)
+        case .lost:
+            guard let rect else { return }
+            trackingFrame.setStyle(.tracking, animated: false)
+            moveTrackingFrame(to: rect, duration: 0)
+            setTrackingPhase(.tracking)
         }
-        let rect = previewView.previewLayer.layerRectConverted(fromMetadataOutputRect: metadataRect)
-        let wasHidden = trackingBox.isHidden
-        trackingBox.isHidden = false
-        if wasHidden {
-            trackingBox.frame = rect
+    }
+
+    func setTrackingPhase(_ phase: TrackingPhase) {
+        trackingPhase = phase
+        let showsFrame: Bool
+        switch phase {
+        case .idle, .lost:
+            showsFrame = false
+            trackingTimeoutTask?.cancel()
+            trackingTimeoutTask = nil
+            trackingLostTask?.cancel()
+            trackingLostTask = nil
+        case .locking:
+            showsFrame = true
+            trackingLostTask?.cancel()
+            trackingLostTask = nil
+        case .tracking:
+            showsFrame = true
+            trackingTimeoutTask?.cancel()
+            trackingTimeoutTask = nil
+        }
+        trackingFrame.isHidden = !showsFrame
+        trackingCloseButton.isHidden = !showsFrame
+        if case .lost = phase {
+            hideFocusHint()
+            trackingBadge.isHidden = false
         } else {
-            UIView.animate(
-                withDuration: 0.1,
-                delay: 0,
-                options: [.beginFromCurrentState, .allowUserInteraction, .curveLinear]
-            ) {
-                self.trackingBox.frame = rect
+            trackingBadge.isHidden = true
+        }
+    }
+
+    /// 收起追踪界面，并让还在路上的锁定请求作废。
+    func resetTrackingUI() {
+        trackingRequestID += 1
+        setTrackingPhase(.idle)
+    }
+
+    /// 系统偶尔会丢一两帧，短暂消失不算丢失，避免提示来回闪。
+    func scheduleTrackingLost() {
+        guard trackingLostTask == nil else { return }
+        trackingLostTask = Task { [weak self] in
+            try? await Task.sleep(for: TrackingUI.lostDebounce)
+            guard let self, !Task.isCancelled else { return }
+            self.trackingLostTask = nil
+            if case .tracking = self.trackingPhase {
+                self.setTrackingPhase(.lost)
             }
         }
+    }
+
+    func moveTrackingFrame(to rect: CGRect, duration: TimeInterval) {
+        let closeCenter = trackingCloseCenter(for: rect)
+        guard duration > 0, !trackingFrame.isHidden else {
+            UIView.performWithoutAnimation {
+                trackingFrame.frame = rect
+                trackingCloseButton.center = closeCenter
+            }
+            return
+        }
+        UIView.animate(
+            withDuration: duration,
+            delay: 0,
+            options: [.beginFromCurrentState, .allowUserInteraction, .curveLinear]
+        ) {
+            self.trackingFrame.frame = rect
+            self.trackingCloseButton.center = closeCenter
+        }
+    }
+
+    /// metadata 坐标转成预览坐标：只保留画面内的部分，主体很小时放大到最小尺寸。
+    func trackingDisplayRect(forMetadataRect metadataRect: CGRect) -> CGRect {
+        let bounds = previewView.bounds
+        var rect = previewView.previewLayer.layerRectConverted(fromMetadataOutputRect: metadataRect)
+        let visible = rect.intersection(bounds)
+        if !visible.isNull {
+            rect = visible
+        }
+        let minSide = TrackingUI.minFrameSide
+        rect = rect.insetBy(dx: min(0, (rect.width - minSide) / 2), dy: min(0, (rect.height - minSide) / 2))
+        rect.origin.x = min(max(rect.origin.x, 0), bounds.width - rect.width)
+        rect.origin.y = min(max(rect.origin.y, 0), bounds.height - rect.height)
+        return rect
+    }
+
+    /// × 默认在框的右上角；贴边或碰到顶部、底部控件时往画面里收。
+    func trackingCloseCenter(for frame: CGRect) -> CGPoint {
+        let inset = trackingCloseButton.bounds.width / 2 + 8
+        let top = flashButton.frame.maxY + inset
+        let bottom = max(top, modeControl.frame.minY - inset)
+        return CGPoint(
+            x: min(max(frame.maxX, inset), previewView.bounds.width - inset),
+            y: min(max(frame.minY, top), bottom)
+        )
     }
 
     func showFocusHint(_ text: String) {
@@ -1156,5 +1386,166 @@ final class PreviewView: UIView {
 
     var previewLayer: AVCaptureVideoPreviewLayer {
         layer as! AVCaptureVideoPreviewLayer
+    }
+}
+
+private enum TrackingPhase {
+    case idle
+    /// 已发起追踪，等系统锁定主体；`box` 是用户画的框（预览坐标）。
+    case locking(requestID: Int, box: CGRect, startedAt: Date)
+    case tracking
+    /// 系统仍在追踪，但主体暂时不在画面里。
+    case lost
+
+    var isActive: Bool {
+        if case .idle = self { return false }
+        return true
+    }
+}
+
+private enum TrackingUI {
+    /// 短边小于这个值的框当成单击对焦。
+    static let minSelectionSide: CGFloat = 40
+    /// 超过这个时间还没锁定主体，就退回普通对焦。
+    static let lockTimeout: Duration = .seconds(1)
+    /// 红框（锁定中）至少显示这么久再变绿。
+    static let minLockingDisplay: TimeInterval = 0.2
+    /// 主体消失超过这个时间才提示目标丢失。
+    static let lostDebounce: Duration = .milliseconds(300)
+    /// 追踪框的最小边长，主体很小时四角不重叠、× 也点得到。
+    static let minFrameSide: CGFloat = 44
+}
+
+/// 追踪框：锁定中是红色整框，追踪中是绿色四角。
+/// 子视图都用 autoresizing 跟随外框，外框在动画里改 frame 时四角会一起动。
+final class TrackingFrameView: UIView {
+    enum Style {
+        case locking
+        case tracking
+    }
+
+    private static let cornerLength: CGFloat = 16
+    private static let cornerLineWidth: CGFloat = 2.5
+    private static let cornerRadius: CGFloat = 6
+
+    private let outline = UIView()
+    private let corners = UIView()
+
+    override init(frame: CGRect) {
+        super.init(frame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        isUserInteractionEnabled = false
+
+        outline.frame = bounds
+        outline.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        outline.layer.borderColor = UIColor.systemRed.cgColor
+        outline.layer.borderWidth = 1.5
+        addSubview(outline)
+
+        corners.frame = bounds
+        corners.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        corners.alpha = 0
+        addSubview(corners)
+        addCorners()
+
+        for shadowed in [outline.layer, corners.layer] {
+            shadowed.shadowColor = UIColor.black.cgColor
+            shadowed.shadowOpacity = 0.35
+            shadowed.shadowRadius = 1.5
+            shadowed.shadowOffset = .zero
+        }
+        self.frame = frame
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func setStyle(_ style: Style, animated: Bool, delay: TimeInterval = 0) {
+        // 只清掉透明度动画，不打断外框正在进行的位移动画。
+        outline.layer.removeAnimation(forKey: "opacity")
+        corners.layer.removeAnimation(forKey: "opacity")
+        let changes = {
+            self.outline.alpha = style == .locking ? 1 : 0
+            self.corners.alpha = style == .tracking ? 1 : 0
+        }
+        if animated {
+            UIView.animate(
+                withDuration: 0.2,
+                delay: delay,
+                options: [.beginFromCurrentState, .allowUserInteraction],
+                animations: changes
+            )
+        } else {
+            changes()
+        }
+    }
+
+    private func addCorners() {
+        let length = Self.cornerLength
+        let inset = Self.cornerLineWidth / 2
+        let radius = Self.cornerRadius
+        // 左上角的 L 形，其余三个角镜像得到。
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: inset, y: length))
+        path.addLine(to: CGPoint(x: inset, y: inset + radius))
+        path.addArc(
+            tangent1End: CGPoint(x: inset, y: inset),
+            tangent2End: CGPoint(x: inset + radius, y: inset),
+            radius: radius
+        )
+        path.addLine(to: CGPoint(x: length, y: inset))
+
+        let far = CGPoint(x: bounds.width - length, y: bounds.height - length)
+        let placements: [(CGAffineTransform, CGPoint, UIView.AutoresizingMask)] = [
+            (.identity, .zero, [.flexibleRightMargin, .flexibleBottomMargin]),
+            (CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: length, ty: 0),
+             CGPoint(x: far.x, y: 0), [.flexibleLeftMargin, .flexibleBottomMargin]),
+            (CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: length),
+             CGPoint(x: 0, y: far.y), [.flexibleRightMargin, .flexibleTopMargin]),
+            (CGAffineTransform(a: -1, b: 0, c: 0, d: -1, tx: length, ty: length),
+             far, [.flexibleLeftMargin, .flexibleTopMargin])
+        ]
+        for (mirror, origin, mask) in placements {
+            var transform = mirror
+            let shape = CAShapeLayer()
+            shape.path = path.copy(using: &transform)
+            shape.strokeColor = UIColor.systemGreen.cgColor
+            shape.fillColor = nil
+            shape.lineWidth = Self.cornerLineWidth
+            shape.lineCap = .round
+            let corner = UIView(frame: CGRect(origin: origin, size: CGSize(width: length, height: length)))
+            corner.autoresizingMask = mask
+            corner.isUserInteractionEnabled = false
+            corner.layer.addSublayer(shape)
+            corners.addSubview(corner)
+        }
+    }
+}
+
+/// 追踪框右上角的 ×：视觉上 24pt，点击范围扩到 44pt。
+final class TrackingCloseButton: UIButton {
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        var config = UIButton.Configuration.filled()
+        config.image = UIImage(systemName: "xmark")
+        config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 10, weight: .bold)
+        config.baseForegroundColor = .black
+        config.baseBackgroundColor = .white
+        config.cornerStyle = .capsule
+        config.contentInsets = .zero
+        configuration = config
+        layer.shadowColor = UIColor.black.cgColor
+        layer.shadowOpacity = 0.3
+        layer.shadowRadius = 2
+        layer.shadowOffset = .zero
+        accessibilityLabel = "取消追踪对焦"
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        bounds.insetBy(dx: -10, dy: -10).contains(point)
     }
 }
