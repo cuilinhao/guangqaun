@@ -74,6 +74,12 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
     private var observers: [NSObjectProtocol] = []
     private var aperture: ApertureSetting = .auto
     private var apertureObservation: NSKeyValueObservation?
+    /// 自动光圈的档位由 App 选，系统自动曝光不会按亮度、远近换光圈，见 AutoAperture.swift。
+    private var autoAperture = AutoApertureController()
+    private var autoApertureTimer: DispatchSourceTimer?
+    /// 排查光圈用（临时）：和 PGY 打同样格式的日志。
+    private var diagnosticsObservations: [NSKeyValueObservation] = []
+    private var diagnosticsTimer: DispatchSourceTimer?
     private var livePhotoEnabled = false
 
     private final class PendingCapture {
@@ -291,7 +297,8 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
         }
     }
 
-    /// 手动光圈走"光圈优先"：锁定 𝑓 值，快门和 ISO 仍由自动曝光维持画面亮度。
+    /// 手动、自动光圈都走"光圈优先"：锁定 𝑓 值，快门和 ISO 仍由自动曝光维持画面亮度。
+    /// 自动时档位由 autoAperture 按亮度和远近选。
     func setAperture(_ setting: ApertureSetting) async throws -> CameraState {
         try await onSessionQueue { [self] in
             guard pendingCapture == nil, let device = deviceInput?.device else { throw CameraError.busy }
@@ -300,11 +307,15 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
             defer { device.unlockForConfiguration() }
             let previous = aperture
             aperture = setting
+            if setting == .auto, let value = autoAperture.chooseNow(Self.uptime) {
+                print("[AutoAperture] auto on → ƒ\(String(format: "%.2f", value)) \(autoAperture.logDescription)")
+            }
             guard applyExposureMode(to: device) else {
                 aperture = previous
                 _ = applyExposureMode(to: device)
                 throw CameraError.apertureUnsupported
             }
+            print("[Aperture] Fdemo setAperture setting=\(aperture) " + ApertureDiagnostics.describe(device, session: session, photoOutput: photoOutput))
             return makeState()
         }
     }
@@ -438,13 +449,15 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
                     print("[Track] stop (tap to focus)")
                     eventHandler?(.ready(makeState()))
                 }
-                if device.isFocusPointOfInterestSupported, device.isFocusModeSupported(.autoFocus) {
+                // 点按后保持连续对焦，不锁焦（PGY 也是对完焦就切回连续）：镜头移动时焦点跟着走。
+                // 自动光圈靠对焦位置判断远近，锁焦后读不到距离变化，光圈就不会跟着变。
+                if device.isFocusPointOfInterestSupported, device.isFocusModeSupported(.continuousAutoFocus) {
                     device.focusPointOfInterest = devicePoint
-                    device.focusMode = .autoFocus
+                    device.focusMode = .continuousAutoFocus
                 }
                 if device.isExposurePointOfInterestSupported {
                     device.exposurePointOfInterest = devicePoint
-                    if !applyManualAperture(to: device), device.isExposureModeSupported(.autoExpose) {
+                    if !applyAperturePriority(to: device), device.isExposureModeSupported(.autoExpose) {
                         device.exposureMode = .autoExpose
                     }
                 }
@@ -647,6 +660,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
 
         try selectApertureCapableVideoFormat(for: device)
         updateMetadataObjectTypes(for: device)
+        autoAperture.reset(stops: apertureStops(for: device), now: Self.uptime)
 
         // activeFormat 跟随 sessionPreset 变化，需等提交配置后再选照片尺寸。
         if let preferred = preferredPhotoDimensions(for: device) {
@@ -671,6 +685,22 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
         position = target
         isConfigured = true
         print("[Camera] configured \(device.localizedName), mode=\(mode), photo=\(photoOutput.maxPhotoDimensions.width)x\(photoOutput.maxPhotoDimensions.height), apertures=\(apertureStops(for: device)), apertureRange=\(apertureRangeDescription(for: device)), focusTracking=\(supportsFocusTracking(device))")
+        print("[Aperture] Fdemo format setting=\(aperture) " + ApertureDiagnostics.describe(device, session: session, photoOutput: photoOutput))
+        startApertureDiagnosticsTicker()
+        startAutoApertureTimer()
+    }
+
+    /// 排查光圈用（临时）：相机运行时每秒打一行曝光状态，和 PGY 的 tick 日志对比。
+    private func startApertureDiagnosticsTicker() {
+        guard diagnosticsTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: sessionQueue)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.session.isRunning, let device = self.deviceInput?.device else { return }
+            print("[Aperture] Fdemo tick setting=\(self.aperture) auto[\(self.autoAperture.logDescription)] " + ApertureDiagnostics.describe(device, session: self.session, photoOutput: self.photoOutput))
+        }
+        timer.resume()
+        diagnosticsTimer = timer
     }
 
     private func apertureRangeDescription(for device: AVCaptureDevice) -> String {
@@ -798,7 +828,7 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
 
     /// 调用方需已持有 `lockForConfiguration`；返回 false 表示当前格式不接受该光圈设置。
     private func applyExposureMode(to device: AVCaptureDevice) -> Bool {
-        if case .manual = aperture, applyManualAperture(to: device) {
+        if applyAperturePriority(to: device) {
             return true
         }
         if device.isExposureModeSupported(.continuousAutoExposure) {
@@ -807,9 +837,21 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
         return aperture == .auto
     }
 
-    private func applyManualAperture(to device: AVCaptureDevice) -> Bool {
-        guard #available(iOS 27.0, *), case .manual(let value) = aperture,
-              !apertureStops(for: device).isEmpty else { return false }
+    /// 要锁的光圈：手动值，或自动光圈选的档位；nil 时交给系统连续自动曝光。
+    private func apertureTarget(for device: AVCaptureDevice) -> Float? {
+        guard !apertureStops(for: device).isEmpty else { return nil }
+        switch aperture {
+        case .manual(let value):
+            return value
+        case .auto:
+            return autoAperture.target
+        }
+    }
+
+    /// 光圈优先：锁定 𝑓 值，快门和 ISO 仍由自动曝光决定。
+    /// 调用方需已持有 `lockForConfiguration`；没有要锁的光圈或格式不接受时返回 false。
+    private func applyAperturePriority(to device: AVCaptureDevice) -> Bool {
+        guard #available(iOS 27.0, *), let value = apertureTarget(for: device) else { return false }
         let format = device.activeFormat
         let target = min(max(value, format.minLensAperture), format.maxLensAperture)
         guard format.supportsExposureModeCustom(
@@ -826,7 +868,44 @@ final class CameraManager: NSObject, AVCapturePhotoCaptureDelegate, AVCaptureFil
         return true
     }
 
+    private static var uptime: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    /// 自动光圈每 0.2 秒读一次曝光和对焦位置，需要换档时按光圈优先下发。
+    private func startAutoApertureTimer() {
+        guard autoApertureTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: sessionQueue)
+        timer.schedule(deadline: .now() + 0.2, repeating: 0.2, leeway: .milliseconds(20))
+        timer.setEventHandler { [weak self] in
+            self?.autoApertureTick()
+        }
+        timer.resume()
+        autoApertureTimer = timer
+    }
+
+    private func autoApertureTick() {
+        guard session.isRunning, !session.isInterrupted, let device = deviceInput?.device,
+              let sample = AutoApertureController.Sample(device: device) else { return }
+        let now = Self.uptime
+        // 手动光圈时也采样，切回自动能直接按当前场景选档。
+        autoAperture.record(sample, now: now)
+        // 拍照、录像中不换档：拍照时换会让这张曝光不准，录像时景深和亮度会突变。
+        guard aperture == .auto, pendingCapture == nil, !movieOutput.isRecording else { return }
+        let previous = autoAperture.target
+        guard let next = autoAperture.update(now: now) else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            _ = applyExposureMode(to: device)
+        } catch {
+            print("[AutoAperture] rejected: \(error.localizedDescription)")
+            return
+        }
+        let from = previous.map { String(format: "%.2f", $0) } ?? "-"
+        print("[AutoAperture] ƒ\(from) → ƒ\(String(format: "%.2f", next)) \(autoAperture.logDescription) iso=\(Int(device.iso)) exp=\(String(format: "%.4f", device.exposureDuration.seconds))s")
+    }
+
     private func observeLensAperture(of device: AVCaptureDevice) {
+        diagnosticsObservations = ApertureDiagnostics.observe(device, tag: "Fdemo")
         apertureObservation = device.observe(\.lensAperture, options: [.new]) { [weak self] device, _ in
             guard let self else { return }
             let value = device.lensAperture
